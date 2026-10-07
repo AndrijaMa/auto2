@@ -1,0 +1,79 @@
+name: Openflow - fetch & apply Parameter Provider
+
+on:
+  # An issue whose title mentions MongoDB, or labelled "MongoDB", triggers a fetch + apply.
+  issues:
+    types: [opened, labeled]
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Apply fetched parameters to parameter contexts (false = fetch only)"
+        type: boolean
+        default: true
+      provider_name:
+        description: "Parameter provider name (blank = first provider)"
+        type: string
+        default: "Openflow - Snowflake Parameter Provider"
+      runtime_key:
+        description: "Runtime key override (blank = repo variable OPENFLOW_RUNTIME_KEY)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  issues: write   # comment the result back on the triggering issue
+
+concurrency:
+  group: openflow-parameter-provider
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.issue.title, 'mongodb') ||
+      contains(github.event.issue.labels.*.name, 'mongodb')
+    runs-on: ubuntu-latest
+    env:
+      # URL = https://<ingress_prefix>--<account>.snowflakecomputing.app/<runtime_key>/nifi-api
+      # Values live in repo variables (Settings > Secrets and variables > Actions > Variables).
+      OPENFLOW_ACCOUNT: ${{ vars.OPENFLOW_ACCOUNT }}
+      OPENFLOW_RUNTIME_KEY: ${{ inputs.runtime_key || vars.OPENFLOW_RUNTIME_KEY }}
+      OPENFLOW_INGRESS_PREFIX: ${{ vars.OPENFLOW_INGRESS_PREFIX }}
+      OPENFLOW_PAT: ${{ secrets.OPENFLOW_PAT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install nipyapi==1.5.0
+      - name: Fetch (and apply) parameters
+        shell: bash -o pipefail {0}
+        env:
+          # Issue-triggered runs have no inputs: use the defaults (apply = true).
+          PROVIDER_NAME: ${{ inputs.provider_name || 'Openflow - Snowflake Parameter Provider' }}
+          APPLY: ${{ github.event_name == 'issues' || inputs.apply }}
+        run: |
+          args=()
+          [ -n "$PROVIDER_NAME" ] && args+=(--name "$PROVIDER_NAME")
+          [ "$APPLY" = "true" ] || args+=(--fetch-only)
+          python scripts/fetch_parameter_provider.py --runtime "$OPENFLOW_RUNTIME_KEY" "${args[@]}" 2>&1 | tee run.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: parameter-provider-fetch
+          path: "*_parameter_provider_fetch_*.json"
+          if-no-files-found: ignore
+      - name: Comment result on issue
+        if: always() && github.event_name == 'issues'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+          RESULT: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          {
+            echo "Openflow parameter provider fetch & apply: **$RESULT** ([run]($RUN_URL))"
+            echo; echo '```'; tail -n 30 run.log 2>/dev/null; echo '```'
+          } > comment.md
+          gh issue comment "$ISSUE" -R "$GITHUB_REPOSITORY" --body-file comment.md
